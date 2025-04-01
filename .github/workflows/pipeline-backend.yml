@@ -1,0 +1,174 @@
+name: Backend CI Pipeline
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'backend/**'
+
+jobs:
+  build:
+    name: Build Backend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          npm install
+
+      - name: Generate Prisma Client
+        run: |
+          cd backend
+          npx prisma generate
+
+      - name: Build backend
+        run: |
+          cd backend
+          npm run build
+          
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: backend-build
+          path: backend/dist/
+  
+  test:
+    name: Test Backend
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: mydatabase
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          npm install
+
+      - name: Generate Prisma Client
+        run: |
+          cd backend
+          npx prisma generate
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: backend-build
+          path: backend/dist/
+
+      - name: Run migrations
+        run: |
+          cd backend
+          npx prisma migrate dev --name init
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/mydatabase
+          
+      - name: Run tests
+        run: |
+          cd backend
+          npm test
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5432/mydatabase
+          
+  production-build:
+    name: Prepare Production Build
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: backend-build
+          path: backend/dist/
+          
+      - name: List artifacts
+        run: |
+          ls -la backend/dist/
+          
+  deploy-ec2:
+    name: Deploy to EC2
+    needs: production-build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        
+      - name: Download build artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: backend-build
+          path: backend/dist/
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-region: eu-west-1
+          
+      - name: Create deployment package
+        run: |
+          cd backend
+          mkdir -p deployment
+          cp -r dist package.json package-lock.json prisma .env deployment/
+          cd deployment
+          zip -r ../deployment.zip .
+          
+      - name: Deploy to EC2
+        run: |
+          # Transferir archivos al servidor EC2
+          echo "${{ secrets.EC2_SSH_KEY }}" > ec2_key.pem
+          chmod 400 ec2_key.pem
+          
+          # Creamos la estructura de directorios en el servidor si no existe
+          ssh -o StrictHostKeyChecking=no -i ec2_key.pem ec2-user@${{ secrets.EC2_INSTANCE }} "mkdir -p ~/app/backend"
+          
+          # Transferimos el archivo de despliegue
+          scp -o StrictHostKeyChecking=no -i ec2_key.pem backend/deployment.zip ec2-user@${{ secrets.EC2_INSTANCE }}:~/app/backend/
+          
+          # Descomprimimos el archivo en el servidor y reiniciamos la aplicación
+          ssh -o StrictHostKeyChecking=no -i ec2_key.pem ec2-user@${{ secrets.EC2_INSTANCE }} "cd ~/app/backend && \
+            unzip -o deployment.zip && \
+            npm install --production && \
+            npx prisma generate && \
+            pm2 restart backend || pm2 start 'npm start' --name backend" 
